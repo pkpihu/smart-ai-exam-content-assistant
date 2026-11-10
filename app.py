@@ -39,14 +39,15 @@ ollama_base_url = st.sidebar.text_input(
 )
 ollama_model = st.sidebar.text_input(
     "Chat Model Name",
-    value="llama3",
+    value="qwen2.5:3b",
 )
 ollama_embed_model = st.sidebar.text_input(
     "Embedding Model Name",
     value="nomic-embed-text",
 )
 st.sidebar.caption(
-    "Ensure Ollama is running locally and models are pulled (e.g., `ollama pull llama3`, `ollama pull nomic-embed-text`)."
+    "Ensure Ollama is running locally and models are pulled "
+    "(e.g., `ollama pull qwen2.5:3b`, `ollama pull nomic-embed-text`)."
 )
 
 DEFAULT_RSS = "https://feeds.bbci.co.uk/news/world/rss.xml"
@@ -358,6 +359,22 @@ def format_mcq_option_lines(markdown_text):
     return notes_section + "\n\n" + "\n".join(formatted_lines).strip()
 
 
+def docs_to_sources(docs):
+    """Convert retrieved documents to a simple, session-state-safe list."""
+    return [
+        (d.metadata.get("title", "Source"), d.metadata.get("source", ""))
+        for d in docs
+    ]
+
+
+def render_sources(label, sources):
+    """Show a sources expander from a list of (title, source) tuples."""
+    with st.expander(label):
+        for title, src in sources:
+            st.write(title)
+            st.caption(src)
+
+
 # -----------------------------------------------------------------------------
 # Question-answering prompt
 # -----------------------------------------------------------------------------
@@ -394,6 +411,10 @@ if "embeddings" not in st.session_state:
     st.session_state.embeddings = None
 if "query_embedding_cache" not in st.session_state:
     st.session_state.query_embedding_cache = {}
+if "qa_result" not in st.session_state:
+    st.session_state.qa_result = None
+if "notes_result" not in st.session_state:
+    st.session_state.notes_result = None
 
 
 # -----------------------------------------------------------------------------
@@ -416,6 +437,8 @@ if clear:
     st.session_state.source_count = 0
     st.session_state.embeddings = None
     st.session_state.query_embedding_cache = {}
+    st.session_state.qa_result = None
+    st.session_state.notes_result = None
     st.rerun()
 
 if build:
@@ -442,7 +465,9 @@ if build:
                 )
                 chunks = splitter.split_documents(docs)
 
-                embeddings = get_embedding_model(ollama_base_url, ollama_embed_model)
+                embeddings = get_embedding_model(
+                    ollama_base_url, ollama_embed_model
+                )
 
                 st.session_state.vectorstore = FAISS.from_documents(
                     chunks,
@@ -451,6 +476,10 @@ if build:
                 st.session_state.embeddings = embeddings
                 st.session_state.query_embedding_cache = {}
                 st.session_state.source_count = len(docs)
+
+                # A new knowledge base makes old answers stale
+                st.session_state.qa_result = None
+                st.session_state.notes_result = None
 
                 st.success(
                     f"Knowledge base ready: {len(docs)} source(s), "
@@ -462,22 +491,25 @@ if build:
 
 
 # -----------------------------------------------------------------------------
-# Ask questions from the collected content
+# Step 2: Ask questions from the collected content
 # -----------------------------------------------------------------------------
 if st.session_state.vectorstore is not None:
     st.divider()
     st.subheader("2. Ask questions from collected content")
 
     question = st.text_input(
-        "Example: Summarize the key facts and explain their possible relevance to competitive exams."
+        "Example: Summarize the key facts and explain their possible relevance to competitive exams.",
+        key="qa_question",
     )
 
-    if st.button("Get answer"):
+    # True only on the run where a fresh answer was just streamed to the screen
+    qa_just_generated = False
+
+    if st.button("Get answer", key="qa_button"):
         if not question.strip():
             st.warning("Enter a question first.")
         else:
             stage_message = st.empty()
-            answer_placeholder = st.empty()
             try:
                 stage_message.info("Searching local vector database...")
                 source_docs = retrieve_documents_with_retry(
@@ -498,25 +530,41 @@ if st.session_state.vectorstore is not None:
                         ollama_base_url, ollama_model, temperature=0.2
                     )
 
-                    stage_message.info("Generating response with local Ollama model...")
+                    stage_message.info(
+                        "Generating response with local Ollama model..."
+                    )
+                    st.markdown(f"**Question:** {question}")
+                    answer_placeholder = st.empty()
                     answer_text = stream_markdown_response(
                         llm, prompt, answer_placeholder
                     )
                     stage_message.empty()
 
-                    with st.expander("Sources used"):
-                        for doc in source_docs:
-                            st.write(doc.metadata.get("title", "Source"))
-                            st.caption(doc.metadata.get("source", ""))
+                    sources = docs_to_sources(source_docs)
+                    render_sources("Sources used", sources)
+
+                    # Persist so it survives later reruns (e.g. Step 3 button)
+                    st.session_state.qa_result = {
+                        "question": question,
+                        "answer": answer_text,
+                        "sources": sources,
+                    }
+                    qa_just_generated = True
 
             except Exception as exc:
                 stage_message.empty()
-                answer_placeholder.empty()
                 st.error(f"Error during execution: {exc}")
+
+    # On every other rerun, redraw the saved answer from session state
+    qa = st.session_state.qa_result
+    if qa and not qa_just_generated:
+        st.markdown(f"**Question:** {qa['question']}")
+        st.markdown(qa["answer"])
+        render_sources("Sources used", qa["sources"])
 
 
 # -----------------------------------------------------------------------------
-# Generate revision notes and MCQs
+# Step 3: Generate revision notes and MCQs
 # -----------------------------------------------------------------------------
 if st.session_state.vectorstore is not None:
     st.divider()
@@ -525,28 +573,39 @@ if st.session_state.vectorstore is not None:
     topic = st.text_input(
         "Topic for revision material",
         placeholder="e.g. International relations, science and technology",
+        key="notes_topic",
     )
-    count = st.slider("Number of MCQs", min_value=3, max_value=10, value=5)
+    count = st.slider(
+        "Number of MCQs", min_value=3, max_value=10, value=5, key="mcq_count"
+    )
 
-    if st.button("Generate notes + MCQs", type="primary") and topic.strip():
-        try:
-            with st.spinner("Retrieving content and generating study notes locally..."):
-                relevant_docs = retrieve_documents_with_retry(
-                    st.session_state.vectorstore, topic, k=4
-                )
+    # True only on the run where fresh notes were just streamed to the screen
+    notes_just_generated = False
 
-                if not relevant_docs:
-                    st.warning("No relevant material found for this topic.")
-                else:
-                    context = "\n\n".join(
-                        doc.page_content for doc in relevant_docs
+    if st.button("Generate notes + MCQs", type="primary", key="notes_button"):
+        if not topic.strip():
+            st.warning("Enter a topic first.")
+        else:
+            try:
+                with st.spinner(
+                    "Retrieving content and generating study notes locally..."
+                ):
+                    relevant_docs = retrieve_documents_with_retry(
+                        st.session_state.vectorstore, topic, k=4
                     )
 
-                    llm = get_ollama_model(
-                        ollama_base_url, ollama_model, temperature=0.2
-                    )
+                    if not relevant_docs:
+                        st.warning("No relevant material found for this topic.")
+                    else:
+                        context = "\n\n".join(
+                            doc.page_content for doc in relevant_docs
+                        )
 
-                    prompt = f"""
+                        llm = get_ollama_model(
+                            ollama_base_url, ollama_model, temperature=0.2
+                        )
+
+                        prompt = f"""
 You are an expert competitive-exam preparation tutor.
 
 Use ONLY the information provided in the CONTEXT below. Do not invent facts, answers, or dates.
@@ -577,18 +636,32 @@ CONTEXT:
 {context}
 """
 
-                    output_placeholder = st.empty()
-                    generated_text = stream_markdown_response(
-                        llm,
-                        prompt,
-                        output_placeholder,
-                        formatter=format_mcq_option_lines,
-                    )
+                        st.markdown(f"**Topic:** {topic}")
+                        output_placeholder = st.empty()
+                        generated_text = stream_markdown_response(
+                            llm,
+                            prompt,
+                            output_placeholder,
+                            formatter=format_mcq_option_lines,
+                        )
 
-                    with st.expander("Source material used"):
-                        for doc in relevant_docs:
-                            st.write(doc.metadata.get("title", "Source"))
-                            st.caption(doc.metadata.get("source", ""))
+                        sources = docs_to_sources(relevant_docs)
+                        render_sources("Source material used", sources)
 
-        except Exception as exc:
-            st.error(f"Could not generate notes and MCQs: {exc}")
+                        # Persist so it survives later reruns (e.g. Step 2 button)
+                        st.session_state.notes_result = {
+                            "topic": topic,
+                            "text": generated_text,
+                            "sources": sources,
+                        }
+                        notes_just_generated = True
+
+            except Exception as exc:
+                st.error(f"Could not generate notes and MCQs: {exc}")
+
+    # On every other rerun, redraw the saved notes from session state
+    nr = st.session_state.notes_result
+    if nr and not notes_just_generated:
+        st.markdown(f"**Topic:** {nr['topic']}")
+        st.markdown(nr["text"])
+        render_sources("Source material used", nr["sources"])
