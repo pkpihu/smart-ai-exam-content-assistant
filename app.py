@@ -9,10 +9,7 @@ from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
-from langchain_google_genai import (
-    ChatGoogleGenerativeAI,
-    GoogleGenerativeAIEmbeddings,
-)
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
 
 
@@ -20,28 +17,36 @@ from langchain_community.vectorstores import FAISS
 # Streamlit page configuration
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Exam Content AI Assistant",
+    page_title="Exam Content Local AI Assistant",
     page_icon="📚",
     layout="wide",
 )
 
-st.title("📚 Smart AI Assistant for Exam Content Aggregation")
+st.title("📚 Smart AI Assistant for Exam Content Aggregation (Ollama Local)")
 st.caption(
     "Collect current-affairs content, create concise exam notes, "
-    "and practise with AI-generated MCQs."
+    "and practise with AI-generated MCQs using local models."
 )
 
 
 # -----------------------------------------------------------------------------
-# API key and source inputs
+# Ollama Configuration sidebar
 # -----------------------------------------------------------------------------
-api_key = st.sidebar.text_input(
-    "Google Gemini API key",
-    type="password",
-    value=os.getenv("GOOGLE_API_KEY", ""),
+st.sidebar.markdown("### Ollama Configuration")
+ollama_base_url = st.sidebar.text_input(
+    "Ollama Base URL",
+    value="http://localhost:11434",
+)
+ollama_model = st.sidebar.text_input(
+    "Chat Model Name",
+    value="llama3",
+)
+ollama_embed_model = st.sidebar.text_input(
+    "Embedding Model Name",
+    value="nomic-embed-text",
 )
 st.sidebar.caption(
-    "Your key is used for this session. Do not share it or upload it to a public repository."
+    "Ensure Ollama is running locally and models are pulled (e.g., `ollama pull llama3`, `ollama pull nomic-embed-text`)."
 )
 
 DEFAULT_RSS = "https://feeds.bbci.co.uk/news/world/rss.xml"
@@ -122,7 +127,6 @@ def collect_sources():
                         title = scraped_title or title
                         content = scraped_body or summary
                     except Exception:
-                        # Keep the RSS summary when the publisher blocks scraping.
                         pass
 
                 if content:
@@ -169,58 +173,34 @@ def collect_sources():
 
 
 # -----------------------------------------------------------------------------
-# Gemini response handling
+# Ollama response handling
 # -----------------------------------------------------------------------------
 def extract_response_text(content):
-    """Extract readable text from string or block-based LangChain responses.
-
-    Gemini/LangChain responses can contain either a plain string or a list of
-    content blocks. Converting a list directly with str() can expose Python's
-    internal list/dictionary representation in the Streamlit page.
-    """
+    """Extract readable text from string or block-based LangChain responses."""
     if isinstance(content, str):
         text = content.strip()
-
     elif isinstance(content, list):
         text_parts = []
-
         for block in content:
-            if isinstance(block, str):
-                if block.strip():
-                    text_parts.append(block.strip())
-
+            if isinstance(block, str) and block.strip():
+                text_parts.append(block.strip())
             elif isinstance(block, dict):
-                # Standard LangChain text blocks commonly use the "text" key.
-                block_type = block.get("type")
                 block_text = block.get("text")
-
-                if block_type in (None, "text") and isinstance(block_text, str):
-                    if block_text.strip():
-                        text_parts.append(block_text.strip())
-
-            else:
-                # Some content block implementations expose a .text attribute.
-                block_text = getattr(block, "text", None)
                 if isinstance(block_text, str) and block_text.strip():
                     text_parts.append(block_text.strip())
-
         text = "\n\n".join(text_parts).strip()
-
     elif isinstance(content, dict):
         block_text = content.get("text")
         text = block_text.strip() if isinstance(block_text, str) else ""
-
     else:
         text = ""
 
-    # Remove an outer Markdown code fence if the model mistakenly adds one.
     text = re.sub(
         r"^\s*```(?:markdown|md)?\s*\n(.*?)\n```\s*$",
         r"\1",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
-
     return text.strip()
 
 
@@ -228,7 +208,6 @@ def extract_stream_chunk_text(content):
     """Extract a streaming chunk without stripping meaningful whitespace."""
     if isinstance(content, str):
         return content
-
     if isinstance(content, list):
         parts = []
         for block in content:
@@ -238,79 +217,34 @@ def extract_stream_chunk_text(content):
                 block_text = block.get("text")
                 if isinstance(block_text, str):
                     parts.append(block_text)
-            else:
-                block_text = getattr(block, "text", None)
-                if isinstance(block_text, str):
-                    parts.append(block_text)
         return "".join(parts)
-
     if isinstance(content, dict):
         block_text = content.get("text")
         return block_text if isinstance(block_text, str) else ""
-
     return ""
 
 
 @st.cache_resource(show_spinner=False)
-def get_gemini_model(api_key, max_output_tokens=900, temperature=0.2):
-    """Reuse Gemini with a bounded request timeout and no hidden retry cycle.
-
-    Multiple automatic retries can make a single Streamlit click appear frozen
-    for several minutes. A clear timeout lets the user retry deliberately.
-    """
-    return ChatGoogleGenerativeAI(
-        model="gemini-3.8-flash",
-        google_api_key=api_key,
+def get_ollama_model(base_url, model_name, temperature=0.2):
+    """Initialize local ChatOllama instance."""
+    return ChatOllama(
+        base_url=base_url,
+        model=model_name,
         temperature=temperature,
-        max_output_tokens=max_output_tokens,
-        timeout=45,
-        max_retries=10,
     )
 
 
 @st.cache_resource(show_spinner=False)
-def get_embedding_model(api_key):
-    """Reuse the embedding client and enforce a 30-second HTTP timeout."""
-    kwargs = {
-        "model": "models/gemini-embedding-001",
-        "google_api_key": api_key,
-    }
-
-    fields = getattr(GoogleGenerativeAIEmbeddings, "model_fields", None)
-    if fields is None:
-        fields = getattr(GoogleGenerativeAIEmbeddings, "__fields__", {})
-
-    if "client_args" in fields:
-        # langchain-google-genai v4+: arguments passed to the underlying HTTPX client.
-        kwargs["client_args"] = {"timeout": 30}
-    elif "request_options" in fields:
-        # Compatibility with releases exposing Google API request options.
-        kwargs["request_options"] = {"timeout": 30}
-    else:
-        raise RuntimeError(
-            "Your langchain-google-genai version does not expose a supported "
-            "embedding timeout setting. Upgrade it with: "
-            "pip install -U langchain-google-genai google-genai"
-        )
-
-    return GoogleGenerativeAIEmbeddings(**kwargs)
-
-
-def is_timeout_error(exc):
-    """Recognize common timeout messages from HTTP and Google API clients."""
-    message = str(exc).lower()
-    return any(term in message for term in (
-        "timed out", "timeout", "deadline exceeded", "read operation"
-    ))
+def get_embedding_model(base_url, embed_model_name):
+    """Initialize local Ollama embeddings instance."""
+    return OllamaEmbeddings(
+        base_url=base_url,
+        model=embed_model_name,
+    )
 
 
 def retrieve_documents_with_retry(vectorstore, query, k=3):
-    """Embed the query once (with an explicit timeout), then search FAISS.
-
-    Avoid automatic retries here: retrying a slow network request can double
-    the time the Streamlit page appears blocked. The user can retry after a
-    visible error instead.
-    """
+    """Retrieve documents from FAISS using local embeddings."""
     embeddings = st.session_state.get("embeddings")
     if embeddings is None:
         embeddings = getattr(vectorstore, "embedding_function", None)
@@ -325,7 +259,6 @@ def retrieve_documents_with_retry(vectorstore, query, k=3):
     if cache_key not in cache:
         cache[cache_key] = embeddings.embed_query(query)
 
-        # Keep the in-session cache small and prevent unbounded growth.
         if len(cache) > 100:
             oldest_key = next(iter(cache))
             if oldest_key != cache_key:
@@ -335,7 +268,7 @@ def retrieve_documents_with_retry(vectorstore, query, k=3):
 
 
 def stream_markdown_response(llm, prompt, placeholder, formatter=None):
-    """Stream Gemini text and render as soon as the first chunk arrives."""
+    """Stream text from local Ollama instance."""
     pieces = []
     chunk_count = 0
 
@@ -347,8 +280,6 @@ def stream_markdown_response(llm, prompt, placeholder, formatter=None):
         pieces.append(piece)
         chunk_count += 1
 
-        # Render the first chunk immediately; then batch small updates to keep
-        # Streamlit responsive without re-rendering on every single token.
         if chunk_count == 1 or chunk_count % 3 == 0:
             placeholder.markdown("".join(pieces))
 
@@ -356,22 +287,17 @@ def stream_markdown_response(llm, prompt, placeholder, formatter=None):
     if formatter is not None:
         final_text = formatter(final_text)
 
-    placeholder.markdown(final_text or "Gemini returned no readable text.")
+    placeholder.markdown(final_text or "Ollama returned no readable text.")
     return final_text
 
 
 def format_mcq_option_lines(markdown_text):
-    """Make sure MCQ options A-D render as separate Markdown paragraphs.
-
-    Streamlit's Markdown renderer can collapse a single newline into a space.
-    This helper also handles Gemini returning multiple options on one line.
-    It only adjusts the MCQ section, leaving revision notes unchanged.
-    """
+    """Ensure MCQ options format correctly."""
     if not markdown_text:
         return markdown_text
 
     heading_match = re.search(
-        r"(?im)^#{1,6}\s*(?:B\.\s*)?MULTIPLE[- ]CHOICE QUESTIONS\b[^\n]*",
+        r"(?im)^#{1,6}\s*(?:B\.\s*)?MULTIPLE\s*CHOICE QUESTIONS\b[^\n]*",
         markdown_text,
     )
     if not heading_match:
@@ -389,8 +315,6 @@ def format_mcq_option_lines(markdown_text):
                 formatted_lines.append("")
             continue
 
-        # Keep answer and explanation lines intact. In particular, do not treat
-        # the letter in "Correct Answer: B." as another option marker.
         if re.match(
             r"^(?:\*\*)?(?:Correct Answer|Explanation)\s*:",
             stripped,
@@ -406,7 +330,6 @@ def format_mcq_option_lines(markdown_text):
         )
 
         if len(option_markers) >= 2:
-            # Split inline sequences such as: A. One B. Two C. Three D. Four
             question_or_prefix = line[:option_markers[0].start()].strip()
             if question_or_prefix:
                 formatted_lines.append(question_or_prefix)
@@ -424,8 +347,6 @@ def format_mcq_option_lines(markdown_text):
                     formatted_lines.append("")
 
         elif re.match(r"^[A-D][.)]\s+", stripped):
-            # Separate options that Gemini returned on individual lines with
-            # only a single newline; blank lines make Markdown preserve them.
             if formatted_lines and formatted_lines[-1] != "":
                 formatted_lines.append("")
             formatted_lines.append(stripped)
@@ -448,12 +369,8 @@ Answer the user's question using the retrieved source material below.
 
 Important instructions:
 - Do NOT require the source material to contain the exact words used in the question.
-- When the user asks what is relevant to a government/competitive exam, identify relevant facts by their subject matter (for example: polity, governance, economy, science and technology, environment, geography, history, international relations, reports, awards, or important events).
-- You may use your general understanding of competitive-exam syllabi ONLY to judge relevance and organize the supplied facts.
+- When the user asks what is relevant to a government/competitive exam, identify relevant facts by their subject matter.
 - Do NOT add outside factual claims, dates, figures, names, or events that are not supported by the retrieved source material.
-- If the context contains useful related facts, explain them clearly even if it does not explicitly mention an exam.
-- If the context is genuinely unrelated or does not contain enough information to answer, say what is missing and suggest a more suitable question or source.
-- Distinguish clearly between facts stated in the source and your assessment of why they may be exam-relevant.
 - Be concise, specific, and readable. Use headings and bullet points where helpful.
 
 Retrieved source material:
@@ -486,7 +403,7 @@ left, right = st.columns([1, 1])
 
 with left:
     build = st.button(
-        "1. Collect content & build knowledge base",
+        "Collect content & build knowledge base",
         type="primary",
         use_container_width=True,
     )
@@ -502,49 +419,46 @@ if clear:
     st.rerun()
 
 if build:
-    if not api_key:
-        st.error("Enter a Google Gemini API key in the sidebar first.")
-    else:
-        try:
-            with st.spinner(
-                "Collecting articles and preparing the searchable knowledge base..."
-            ):
-                docs, errors = collect_sources()
+    try:
+        with st.spinner(
+            "Collecting articles and preparing the local searchable knowledge base..."
+        ):
+            docs, errors = collect_sources()
 
-                if errors:
-                    with st.expander("Source warnings"):
-                        for error in errors:
-                            st.warning(error)
+            if errors:
+                with st.expander("Source warnings"):
+                    for error in errors:
+                        st.warning(error)
 
-                if not docs:
-                    st.error(
-                        "No content was collected. Add a working RSS URL, "
-                        "article URL, or pasted text."
-                    )
-                else:
-                    splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=900,
-                        chunk_overlap=150,
-                    )
-                    chunks = splitter.split_documents(docs)
+            if not docs:
+                st.error(
+                    "No content was collected. Add a working RSS URL, "
+                    "article URL, or pasted text."
+                )
+            else:
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=900,
+                    chunk_overlap=150,
+                )
+                chunks = splitter.split_documents(docs)
 
-                    embeddings = get_embedding_model(api_key)
+                embeddings = get_embedding_model(ollama_base_url, ollama_embed_model)
 
-                    st.session_state.vectorstore = FAISS.from_documents(
-                        chunks,
-                        embeddings,
-                    )
-                    st.session_state.embeddings = embeddings
-                    st.session_state.query_embedding_cache = {}
-                    st.session_state.source_count = len(docs)
+                st.session_state.vectorstore = FAISS.from_documents(
+                    chunks,
+                    embeddings,
+                )
+                st.session_state.embeddings = embeddings
+                st.session_state.query_embedding_cache = {}
+                st.session_state.source_count = len(docs)
 
-                    st.success(
-                        f"Knowledge base ready: {len(docs)} source(s), "
-                        f"{len(chunks)} searchable chunk(s)."
-                    )
+                st.success(
+                    f"Knowledge base ready: {len(docs)} source(s), "
+                    f"{len(chunks)} searchable chunk(s)."
+                )
 
-        except Exception as exc:
-            st.error(f"Could not build the knowledge base: {exc}")
+    except Exception as exc:
+        st.error(f"Could not build the knowledge base: {exc}")
 
 
 # -----------------------------------------------------------------------------
@@ -561,29 +475,18 @@ if st.session_state.vectorstore is not None:
     if st.button("Get answer"):
         if not question.strip():
             st.warning("Enter a question first.")
-        elif not api_key:
-            st.error("Enter your Gemini API key.")
         else:
-            stage = "starting the search"
             stage_message = st.empty()
             answer_placeholder = st.empty()
             try:
-                # Stage 1: Embedding request + local FAISS similarity search.
-                stage = "embedding your question and searching the knowledge base"
-                stage_message.info(
-                    "**Step 1 of 2 — Searching your knowledge base.** "
-                    "This normally takes a few seconds."
-                )
+                stage_message.info("Searching local vector database...")
                 source_docs = retrieve_documents_with_retry(
                     st.session_state.vectorstore, question, k=3
                 )
 
                 if not source_docs:
                     stage_message.empty()
-                    st.warning(
-                        "No relevant material was found. Try another question "
-                        "or add more source content."
-                    )
+                    st.warning("No relevant material found.")
                 else:
                     context = "\n\n".join(
                         doc.page_content[:1800] for doc in source_docs
@@ -591,32 +494,15 @@ if st.session_state.vectorstore is not None:
                     prompt = QA_PROMPT.format(
                         context=context, question=question
                     )
-                    llm = get_gemini_model(
-                        api_key, max_output_tokens=900, temperature=0.2
+                    llm = get_ollama_model(
+                        ollama_base_url, ollama_model, temperature=0.2
                     )
 
-                    # Stage 2: Gemini generation. Show feedback before the
-                    # blocking network stream begins, then render each first
-                    # token as soon as it arrives.
-                    stage = "waiting for Gemini to generate the answer"
-                    stage_message.info(
-                        "**Step 2 of 2 — Generating your answer with Gemini.** "
-                        "The answer will appear below as text arrives. "
-                        "The request has a 45-second timeout."
-                    )
-                    answer_placeholder.caption(
-                        "Connected to the generation step; waiting for the first text..."
-                    )
+                    stage_message.info("Generating response with local Ollama model...")
                     answer_text = stream_markdown_response(
                         llm, prompt, answer_placeholder
                     )
                     stage_message.empty()
-
-                    if not answer_text:
-                        st.warning(
-                            "Gemini completed the request but returned no readable text. "
-                            "Please try a shorter question."
-                        )
 
                     with st.expander("Sources used"):
                         for doc in source_docs:
@@ -626,17 +512,7 @@ if st.session_state.vectorstore is not None:
             except Exception as exc:
                 stage_message.empty()
                 answer_placeholder.empty()
-                if is_timeout_error(exc):
-                    st.error(
-                        f"The request timed out while {stage}. "
-                        "The app now stops waiting after a bounded timeout instead "
-                        "of retrying silently. Check your internet connection, "
-                        "Gemini API quota/status, then click Get answer again."
-                    )
-                else:
-                    st.error(
-                        f"Could not generate an answer while {stage}: {exc}"
-                    )
+                st.error(f"Error during execution: {exc}")
 
 
 # -----------------------------------------------------------------------------
@@ -653,133 +529,66 @@ if st.session_state.vectorstore is not None:
     count = st.slider("Number of MCQs", min_value=3, max_value=10, value=5)
 
     if st.button("Generate notes + MCQs", type="primary") and topic.strip():
-        if not api_key:
-            st.error("Enter your Gemini API key in the sidebar.")
-        else:
-            try:
-                with st.spinner(
-                    "Retrieving relevant content and generating study material..."
-                ):
-                    # Four chunks provide useful context without sending an
-                    # unnecessarily large prompt to Gemini.
-                    relevant_docs = retrieve_documents_with_retry(
-                        st.session_state.vectorstore, topic, k=4
+        try:
+            with st.spinner("Retrieving content and generating study notes locally..."):
+                relevant_docs = retrieve_documents_with_retry(
+                    st.session_state.vectorstore, topic, k=4
+                )
+
+                if not relevant_docs:
+                    st.warning("No relevant material found for this topic.")
+                else:
+                    context = "\n\n".join(
+                        doc.page_content for doc in relevant_docs
                     )
 
-                    if not relevant_docs:
-                        st.warning(
-                            "No relevant material was found for this topic. "
-                            "Try another topic or add more source material."
-                        )
-                    else:
-                        context = "\n\n".join(
-                            doc.page_content for doc in relevant_docs
-                        )
+                    llm = get_ollama_model(
+                        ollama_base_url, ollama_model, temperature=0.2
+                    )
 
-                        llm = get_gemini_model(
-                            api_key, max_output_tokens=2000, temperature=0.2
-                        )
-
-                        prompt = f"""
+                    prompt = f"""
 You are an expert competitive-exam preparation tutor.
 
-Use ONLY the information provided in the CONTEXT below. Do not invent facts,
-answers, dates, names, statistics, or explanations. Do not use outside knowledge.
-If the context does not contain enough information for the requested topic,
-clearly say that the source material is insufficient.
+Use ONLY the information provided in the CONTEXT below. Do not invent facts, answers, or dates.
 
 TOPIC: {topic}
 
 Create the following two sections.
 
 ## A. REVISION NOTES
-
-- Use clear headings and subheadings.
-- Use concise bullet points suitable for competitive examinations.
-- Highlight important terms, names, dates, definitions, and concepts using
-  Markdown bold where appropriate.
-- Include only facts supported by the supplied context.
-- Avoid repetitive introductions and filler text.
+- Use clear headings, subheadings, and concise bullet points.
+- Highlight important terms using Markdown bold.
 
 ## B. MULTIPLE-CHOICE QUESTIONS
-
 Generate EXACTLY {count} different MCQs based only on the supplied context.
-Each question must have exactly four options and one unambiguously correct answer.
+Each question must have four options and one correct answer.
 
-Use this exact Markdown structure for every question:
-
-### Question 1. [Write the question here]
-
+Use this exact format for every question:
+### Question 1. [Write question here]
 A. [Option A]
 B. [Option B]
 C. [Option C]
 D. [Option D]
 
 **Correct Answer:** B. [Correct option text]
-
-**Explanation:** [One concise sentence explaining why this answer is correct.]
-
-Continue numbering sequentially up to Question {count}.
-
-FORMATTING RULES:
-1. Return readable Markdown, not JSON, Python, XML, or a Python list/dictionary.
-2. Do not put the complete answer inside a code block.
-3. Keep a blank line between each question, its options, answer, and explanation.
-4. Do not add options E or F.
-5. Do not repeat questions or options.
-6. Do not provide an answer that is unsupported by the context.
-7. Put options A, B, C, and D on four separate lines; never place two options on the same line.
+**Explanation:** [One concise sentence.]
 
 CONTEXT:
 {context}
 """
 
-                        output_placeholder = st.empty()
-                        generated_text = stream_markdown_response(
-                            llm,
-                            prompt,
-                            output_placeholder,
-                            formatter=format_mcq_option_lines,
-                        )
-
-                        if not generated_text:
-                            st.error(
-                                "Gemini returned no readable text. "
-                                "Please try again or check the model/API response."
-                            )
-
-                        with st.expander("Source material used"):
-                            for doc in relevant_docs:
-                                st.write(doc.metadata.get("title", "Source"))
-                                st.caption(doc.metadata.get("source", ""))
-
-                        st.caption(
-                            "Generated from retrieved material. Verify important "
-                            "facts with official sources before using them for exam preparation."
-                        )
-
-            except Exception as exc:
-                if is_timeout_error(exc):
-                    st.error(
-                        "The request timed out while retrieving material or generating notes. "
-                        "The embedding and Gemini requests use bounded timeouts. "
-                        "Please check your connection and try again."
+                    output_placeholder = st.empty()
+                    generated_text = stream_markdown_response(
+                        llm,
+                        prompt,
+                        output_placeholder,
+                        formatter=format_mcq_option_lines,
                     )
-                else:
-                    st.error(f"Could not generate notes and MCQs: {exc}")
 
+                    with st.expander("Source material used"):
+                        for doc in relevant_docs:
+                            st.write(doc.metadata.get("title", "Source"))
+                            st.caption(doc.metadata.get("source", ""))
 
-# -----------------------------------------------------------------------------
-# Sidebar help
-# -----------------------------------------------------------------------------
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Demo flow**")
-st.sidebar.markdown(
-    "1. Add an RSS feed, article URL, or study text.\n"
-    "2. Build the knowledge base.\n"
-    "3. Ask a question (answers stream onto the page).\n"
-    "4. Generate revision notes and MCQs (also streamed)."
-)
-st.sidebar.caption(
-    "Use only sources you are allowed to access. Some websites block automated scraping."
-)
+        except Exception as exc:
+            st.error(f"Could not generate notes and MCQs: {exc}")
