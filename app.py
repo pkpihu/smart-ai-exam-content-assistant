@@ -292,71 +292,119 @@ def stream_markdown_response(llm, prompt, placeholder, formatter=None):
     return final_text
 
 
+def strip_placeholder_labels(text):
+    """Remove template placeholders such as '[Option A]' that small models
+    sometimes copy literally from the prompt."""
+    text = re.sub(r"\[\s*Option\s+[A-D]\s*\]\s*[:\-]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[\s*Correct\s+option\s+text\s*\]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[\s*Write\s+question\s+here\s*\]\s*", "", text, flags=re.IGNORECASE)
+    return text
+
+
 def format_mcq_option_lines(markdown_text):
-    """Ensure MCQ options format correctly."""
+    """Put every MCQ part (question, each option, answer, explanation) on its
+    own line, even when the model writes them all on one line."""
     if not markdown_text:
         return markdown_text
 
+    markdown_text = strip_placeholder_labels(markdown_text)
+
+    # Find where the MCQ part starts: prefer the section heading, otherwise
+    # fall back to the first "Question 1".
     heading_match = re.search(
-        r"(?im)^#{1,6}\s*(?:B\.\s*)?MULTIPLE\s*CHOICE QUESTIONS\b[^\n]*",
+        r"(?im)^#{1,6}\s*(?:B[.)]\s*)?MULTIPLE[\s-]*CHOICE[\s-]*QUESTIONS?\b[^\n]*",
         markdown_text,
     )
-    if not heading_match:
-        return markdown_text
+    if heading_match:
+        notes_section = markdown_text[:heading_match.end()]
+        mcq_section = markdown_text[heading_match.end():]
+    else:
+        question_match = re.search(
+            r"(?im)^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?Question[ \t]*1\b",
+            markdown_text,
+        )
+        if not question_match:
+            return markdown_text
+        notes_section = markdown_text[:question_match.start()].rstrip()
+        mcq_section = markdown_text[question_match.start():]
 
-    notes_section = markdown_text[:heading_match.end()]
-    mcq_section = markdown_text[heading_match.end():]
+    # Force line breaks before "### Question N", "Correct Answer:" and
+    # "Explanation:" in case they were glued onto the previous text.
+    mcq_section = re.sub(
+        r"\s*(#{1,6}[ \t]*Question[ \t]+\d+)", r"\n\n\1", mcq_section
+    )
+    mcq_section = re.sub(
+        r"[ \t]*(\*\*)?(Correct Answer|Explanation)[ \t]*:",
+        r"\n\1\2:",
+        mcq_section,
+        flags=re.IGNORECASE,
+    )
+
     formatted_lines = []
 
-    for line in mcq_section.splitlines():
-        stripped = line.strip()
+    def add_blank():
+        if formatted_lines and formatted_lines[-1] != "":
+            formatted_lines.append("")
+
+    for raw_line in mcq_section.splitlines():
+        stripped = raw_line.strip()
 
         if not stripped:
-            if formatted_lines and formatted_lines[-1] != "":
-                formatted_lines.append("")
+            add_blank()
             continue
 
+        # Turn "- A. text" or "* A. text" into "A. text"
+        stripped = re.sub(r"^[-*\u2022]\s+(?=[A-D][.)]\s)", "", stripped)
+
+        # Question headings get a blank line before them, then continue below
+        # so any options glued onto the heading line are still split apart.
+        if stripped.startswith("#"):
+            add_blank()
+
+        # Correct Answer / Explanation lines
         if re.match(
             r"^(?:\*\*)?(?:Correct Answer|Explanation)\s*:",
             stripped,
             flags=re.IGNORECASE,
         ):
-            if formatted_lines and formatted_lines[-1] != "":
-                formatted_lines.append("")
+            add_blank()
             formatted_lines.append(stripped)
             continue
 
-        option_markers = list(
-            re.finditer(r"(?<![A-Za-z0-9_])([A-D])[.)]\s+", line)
-        )
+        # Find option markers (A. / B) / C. ...) in strictly increasing order
+        option_markers = []
+        last_letter = ""
+        for marker in re.finditer(r"(?<![A-Za-z0-9_])([A-D])[.)]\s+", stripped):
+            if marker.group(1) > last_letter:
+                option_markers.append(marker)
+                last_letter = marker.group(1)
 
         if len(option_markers) >= 2:
-            question_or_prefix = line[:option_markers[0].start()].strip()
-            if question_or_prefix:
-                formatted_lines.append(question_or_prefix)
-                formatted_lines.append("")
-
+            # Several options on one line: split them apart
+            prefix = stripped[:option_markers[0].start()].strip()
+            if prefix:
+                add_blank()
+                formatted_lines.append(prefix)
             for index, marker in enumerate(option_markers):
                 option_end = (
                     option_markers[index + 1].start()
                     if index + 1 < len(option_markers)
-                    else len(line)
+                    else len(stripped)
                 )
-                option_text = line[marker.start():option_end].strip()
+                option_text = stripped[marker.start():option_end].strip()
                 if option_text:
+                    add_blank()
                     formatted_lines.append(option_text)
-                    formatted_lines.append("")
 
         elif re.match(r"^[A-D][.)]\s+", stripped):
-            if formatted_lines and formatted_lines[-1] != "":
-                formatted_lines.append("")
+            # A single option on its own line
+            add_blank()
             formatted_lines.append(stripped)
-            formatted_lines.append("")
 
         else:
             formatted_lines.append(stripped)
 
-    return notes_section + "\n\n" + "\n".join(formatted_lines).strip()
+    return notes_section.rstrip() + "\n\n" + "\n".join(formatted_lines).strip()
 
 
 def docs_to_sources(docs):
@@ -622,15 +670,21 @@ Create the following two sections.
 Generate EXACTLY {count} different MCQs based only on the supplied context.
 Each question must have four options and one correct answer.
 
-Use this exact format for every question:
-### Question 1. [Write question here]
-A. [Option A]
-B. [Option B]
-C. [Option C]
-D. [Option D]
+Follow the layout of this example for every question. The example is only
+a layout guide: do NOT reuse its wording, and never write placeholder text
+such as "Option A" or square brackets. Write real question and answer text
+taken from the CONTEXT, with each option on its own line.
 
-**Correct Answer:** B. [Correct option text]
-**Explanation:** [One concise sentence.]
+### Question 1. Which city is the capital of France?
+A. Berlin
+B. Paris
+C. Madrid
+D. Rome
+
+**Correct Answer:** B. Paris
+**Explanation:** Paris is the capital and largest city of France.
+
+Now write the real questions, numbered Question 1 to Question {count}.
 
 CONTEXT:
 {context}
